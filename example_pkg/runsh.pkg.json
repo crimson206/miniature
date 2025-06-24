@@ -1,0 +1,8 @@
+{
+    "name": "my-example-package",
+    "version": "0.1.0",
+    "description": "runsh is a tool to run scripts.",
+    "db-repo": "https://github.com/crimson206/my-scripts",
+    "branch": "main",
+    "root-dir": "examples/example-pkg"
+}
