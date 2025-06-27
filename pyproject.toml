@@ -1,0 +1,11 @@
+[project]
+name = "miniature"
+version = "1.0.0"
+description = ""
+authors = [
+    {name = "Sisung Kim",email = "sisung.kim1@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+]
