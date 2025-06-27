@@ -1,0 +1,8 @@
+[
+    {
+        "name": "my-prompts",
+        "description": "Local copy of https://github.com/crimson206/my-prompts",
+        "db-repo": "https://github.com/crimson206/my-prompts",
+        "local_path": "~/miniature/my-prompts"
+    }
+]
