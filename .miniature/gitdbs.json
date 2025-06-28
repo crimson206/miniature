@@ -1,8 +1,14 @@
 [
     {
-        "name": "my-prompts",
-        "description": "Local copy of https://github.com/crimson206/my-prompts",
-        "db-repo": "https://github.com/crimson206/my-prompts",
-        "local_path": "~/miniature/my-prompts"
+        "name": "runsh scripts",
+        "description": "collection of runsh scripts",
+        "db-repo": "https://github.com/crimson206/test-miniature",
+        "local_path": "~/miniature/test-miniature"
+    },
+    {
+        "name": "my-scripts",
+        "description": "collection of runsh scripts",
+        "db-repo": "https://github.com/crimson206/my-scripts",
+        "local_path": "~/miniature/my-scripts"
     }
 ]
