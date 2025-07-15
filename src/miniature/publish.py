@@ -1,8 +1,15 @@
+"""Package publishing functionality with repotree support."""
+
 import json
 import os
+import shutil
 from typing import Optional, Dict, Any
-from .push import push_pkg
-from .tag import create_tag
+from pathlib import Path
+from git import Repo
+
+from .cache import get_cache
+from .models import PkgJson
+from .tag import tag_pkg
 
 
 def publish_pkg(
@@ -12,146 +19,242 @@ def publish_pkg(
     push: bool = True,
     tag: bool = True,
     force_tag: bool = False,
-    gitdbs_config: str = ".miniature/gitdbs.json"
+    gitdbs_config: Optional[str] = None,  # Deprecated
+    cache_dir: Optional[str] = None,
+    default_branch: str = "main",
 ) -> Dict[str, Any]:
-    """Publish a package with push and optional tagging using local repository.
-    
+    """Publish a package to git repository with optional tagging.
+
+    This function:
+    1. Copies package files to local repository cache
+    2. Commits changes
+    3. Optionally creates version tag (with branch-based versioning)
+    4. Optionally pushes to remote
+
     Args:
         pkg_dir: Directory containing the package to publish
         meta_file: Name of the meta file (default: "pkg.json")
-        commit_message: Custom commit message (default: "Update from {dirname}")
-        push: Whether to push changes to remote (default: True)
-        tag: Whether to create a tag (default: True)
-        force_tag: Whether to force overwrite existing tag (default: False)
-        gitdbs_config: Path to gitdbs config file
-        
+        commit_message: Custom commit message
+        push: Whether to push changes to remote
+        tag: Whether to create a version tag
+        force_tag: Whether to force overwrite existing tag
+        gitdbs_config: DEPRECATED
+        cache_dir: Cache directory path
+        default_branch: Default branch name for tagging
+
     Returns:
-        Dict containing operation result with keys:
-        - success: bool
-        - repo_path: str (path to local repository)
-        - commit_message: str
-        - pushed: bool
-        - tag_result: Dict from create_tag (if tag=True)
-        - message: str
-        
-    Raises:
-        FileNotFoundError: If meta file doesn't exist
-        ShellError: If git operations fail
-        ValueError: If tag exists and force_tag=False
+        Dict containing operation result
     """
-    # Load package configuration to get version and root-dir
-    meta_file_path = os.path.join(pkg_dir, meta_file)
-    
-    if not os.path.exists(meta_file_path):
-        raise FileNotFoundError(f"Meta file not found: {meta_file_path}")
-    
-    with open(meta_file_path, 'r') as f:
-        pkg_config = json.load(f)
-    
-    version = pkg_config.get('version')
-    root_dir = pkg_config.get('root-dir', '')
-    repo_url = pkg_config.get('db-repo')
-    
-    if not version:
-        raise ValueError(f"No 'version' found in {meta_file}")
-    
-    if not repo_url:
-        raise ValueError(f"No 'db-repo' found in {meta_file}")
-    
-    # Push the package
-    push_result = push_pkg(
-        pkg_dir=pkg_dir,
-        meta_file=meta_file,
-        commit_message=commit_message,
-        push=push,
-        gitdbs_config=gitdbs_config
-    )
-    
-    if not push_result["success"]:
-        return push_result
-    
-    # Create tag if requested
-    tag_result = None
-    if tag:
-        # Generate tag name: {root-dir}/{version}
-        tag_name = f"{root_dir}/{version}" if root_dir else version
-        
-        try:
-            tag_result = create_tag(
-                repo_url=repo_url,
-                tag_name=tag_name,
-                tag_message=f"Release {tag_name}",
-                force=force_tag,
-                push=push,  # Same push setting as main operation
-                gitdbs_config=gitdbs_config
-            )
-        except Exception as e:
-            # If tagging fails, return push result with error info
+    # Load package metadata
+    pkg_path = Path(pkg_dir)
+    meta_file_path = pkg_path / meta_file
+
+    if not meta_file_path.exists():
+        return {"success": False, "message": f"Meta file not found: {meta_file_path}"}
+
+    # Load package configuration
+    pkg_json = PkgJson.from_file(meta_file_path)
+
+    if not pkg_json.db_repo:
+        return {"success": False, "message": "No 'db-repo' found in package metadata"}
+
+    # Get repository URL and paths
+    repo_url = pkg_json.db_repo
+    root_dir = pkg_json.root_dir or "."
+    branch = pkg_json.branch or default_branch
+
+    # Set default commit message
+    if commit_message is None:
+        commit_message = f"Update {pkg_json.name}"
+        if pkg_json.version:
+            commit_message += f" v{pkg_json.version}"
+
+    try:
+        # Get cache instance
+        cache = get_cache(Path(cache_dir) if cache_dir else None)
+
+        # Clone or update repository in cache
+        repo_path = cache.clone_or_update(repo_url, branch)
+
+        # Get git repository
+        git_repo = Repo(repo_path)
+
+        # Checkout correct branch
+        if branch in git_repo.heads:
+            git_repo.heads[branch].checkout()
+        elif f"origin/{branch}" in git_repo.refs:
+            git_repo.create_head(branch, f"origin/{branch}").checkout()
+        else:
+            # Create new branch
+            git_repo.create_head(branch).checkout()
+
+        # Determine target directory in repository
+        target_path = repo_path / root_dir
+        target_path.mkdir(parents=True, exist_ok=True)
+
+        # Copy package files to repository
+        # Get all files except git and cache directories
+        for item in pkg_path.iterdir():
+            if item.name in [".git", ".gitignore", "__pycache__", ".pytest_cache"]:
+                continue
+
+            target_item = target_path / item.name
+
+            if item.is_dir():
+                if target_item.exists():
+                    shutil.rmtree(target_item)
+                shutil.copytree(item, target_item)
+            else:
+                shutil.copy2(item, target_item)
+
+        # Stage all changes
+        git_repo.index.add([str(target_path)])
+
+        # Check if there are changes to commit
+        if not git_repo.is_dirty():
             return {
-                "success": False,
-                "repo_path": push_result["repo_path"],
-                "commit_message": push_result["commit_message"],
-                "pushed": push_result["pushed"],
+                "success": True,
+                "repo_path": str(repo_path),
+                "commit_message": "No changes to commit",
+                "pushed": False,
                 "tag_result": None,
-                "message": f"Push successful but tagging failed: {e}"
+                "message": "No changes to commit",
             }
-    
-    # Combine results
-    if tag and tag_result:
-        message = f"{push_result['message']}, {tag_result['message']}"
-    else:
-        message = push_result['message']
-    
-    result = {
-        "success": True,
-        "repo_path": push_result["repo_path"],
-        "commit_message": push_result["commit_message"],
-        "pushed": push_result["pushed"],
-        "tag_result": tag_result,
-        "message": message
-    }
-    
-    return result
+
+        # Commit changes
+        git_repo.index.commit(commit_message)
+
+        # Push if requested
+        pushed = False
+        if push:
+            origin = git_repo.remote("origin")
+            origin.push(branch)
+            pushed = True
+
+        # Create tag if requested
+        tag_result = None
+        if tag and pkg_json.version:
+            tag_result = tag_pkg(
+                pkg_dir=pkg_dir,
+                meta_file=meta_file,
+                force=force_tag,
+                push=push,
+                cache_dir=cache_dir,
+                default_branch=default_branch,
+            )
+
+            if not tag_result["success"]:
+                return {
+                    "success": False,
+                    "repo_path": str(repo_path),
+                    "commit_message": commit_message,
+                    "pushed": pushed,
+                    "tag_result": tag_result,
+                    "message": f"Commit successful but tagging failed: {tag_result['message']}",
+                }
+
+        # Build success message
+        message_parts = [f"Successfully published {pkg_json.name}"]
+        if pushed:
+            message_parts.append("pushed to remote")
+        if tag_result:
+            message_parts.append(f"tagged as {tag_result['tag_name']}")
+
+        return {
+            "success": True,
+            "repo_path": str(repo_path),
+            "commit_message": commit_message,
+            "pushed": pushed,
+            "tag_result": tag_result,
+            "message": ", ".join(message_parts),
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Failed to publish package: {e}",
+            "error": e,
+        }
 
 
-def publish_pkg_from_json(
-    pkg_json_path: str,
+def publish_from_config(
+    config_file: str,
+    package_names: Optional[list] = None,
     commit_message: Optional[str] = None,
     push: bool = True,
     tag: bool = True,
     force_tag: bool = False,
-    gitdbs_config: str = ".miniature/gitdbs.json"
-) -> Dict[str, Any]:
-    """Publish a package using full path to pkg.json file.
-    
-    This is a convenience function that extracts the directory and file name
-    from the full pkg.json path.
-    
+    cache_dir: Optional[str] = None,
+) -> list[Dict[str, Any]]:
+    """Publish multiple packages from configuration file.
+
     Args:
-        pkg_json_path: Full path to pkg.json file
+        config_file: Path to repotree.json or similar config
+        package_names: List of package names to publish (None = all)
         commit_message: Custom commit message
-        push: Whether to push changes to remote (default: True)
-        tag: Whether to create a tag (default: True)
-        force_tag: Whether to force overwrite existing tag (default: False)
-        gitdbs_config: Path to gitdbs config file
-        
+        push: Whether to push changes
+        tag: Whether to create tags
+        force_tag: Whether to force overwrite tags
+        cache_dir: Cache directory path
+
     Returns:
-        Dict containing operation result
-        
-    Raises:
-        FileNotFoundError: If pkg.json doesn't exist
-        ShellError: If git operations fail
-        ValueError: If tag exists and force_tag=False
+        List of results for each package
     """
-    pkg_dir = os.path.dirname(os.path.abspath(pkg_json_path))
-    meta_file = os.path.basename(pkg_json_path)
-    
-    return publish_pkg(
-        pkg_dir=pkg_dir,
-        meta_file=meta_file,
-        commit_message=commit_message,
-        push=push,
-        tag=tag,
-        force_tag=force_tag,
-        gitdbs_config=gitdbs_config
-    )
+    from .models import RepotreeConfig
+
+    config = RepotreeConfig.from_file(Path(config_file))
+    results = []
+
+    for entry in config.get_loaded_entries():
+        if package_names and entry.pkg_name not in package_names:
+            continue
+
+        # Skip if no local directory
+        if not entry.local_dir:
+            results.append(
+                {
+                    "success": False,
+                    "package": entry.pkg_name,
+                    "message": "No local directory specified",
+                }
+            )
+            continue
+
+        # Check if local directory exists
+        local_path = Path(entry.local_dir)
+        if not local_path.exists():
+            results.append(
+                {
+                    "success": False,
+                    "package": entry.pkg_name,
+                    "message": f"Local directory not found: {entry.local_dir}",
+                }
+            )
+            continue
+
+        # Check for pkg.json
+        pkg_json_path = local_path / "pkg.json"
+        if not pkg_json_path.exists():
+            results.append(
+                {
+                    "success": False,
+                    "package": entry.pkg_name,
+                    "message": "No pkg.json found in local directory",
+                }
+            )
+            continue
+
+        # Publish the package
+        result = publish_pkg(
+            pkg_dir=str(local_path),
+            commit_message=commit_message,
+            push=push,
+            tag=tag,
+            force_tag=force_tag,
+            cache_dir=cache_dir,
+        )
+
+        result["package"] = entry.pkg_name
+        results.append(result)
+
+    return results

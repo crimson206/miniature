@@ -1,444 +1,387 @@
+"""Package loading functionality aligned with repotree requirements."""
+
 import os
 import re
 import json
 import shutil
-from typing import Optional, Dict, Any, List
-from pyshell import shell, ShellError
+from typing import Optional, Dict, Any, List, Union
+from pathlib import Path
 
-
-def get_local_repo_path(repo_url: str, gitdbs_config: str = ".miniature/gitdbs.json") -> Optional[str]:
-    """Get local path for a repository from gitdbs config.
-    
-    Args:
-        repo_url: Repository URL (e.g., "https://github.com/user/repo")
-        gitdbs_config: Path to gitdbs config file
-        
-    Returns:
-        Local repository path or None if not found
-    """
-    if not os.path.exists(gitdbs_config):
-        return None
-    
-    with open(gitdbs_config, 'r') as f:
-        configs = json.load(f)
-    
-    for config in configs:
-        if config.get('db-repo') == repo_url:
-            local_path = config.get('local_path', '')
-            if local_path.startswith('~'):
-                local_path = os.path.expanduser(local_path)
-            return local_path
-    
-    return None
+from .cache import get_cache, RepositoryCache
+from .models import PackageDefinition, RepotreeConfig, PkgJson
+from git import Repo
+import packaging.version
+import packaging.specifiers
 
 
 def load_pkg(
-    repo: str,
-    path: str,
+    repo: Optional[str] = None,
     version: Optional[str] = None,
     target_dir: Optional[str] = None,
     branch: str = "main",
     clean: bool = False,
-    gitdbs_config: str = ".miniature/gitdbs.json"
+    gitdbs_config: Optional[str] = None,  # Deprecated
+    cache_dir: Optional[str] = None,
+    # New parameters for repotree
+    package_def: Optional[PackageDefinition] = None,
+    use_symlink: bool = False,
 ) -> Dict[str, Any]:
-    """Load a package from a local git repository.
-    
+    """Load a package from a git repository using cache.
+
     Args:
-        repo: Repository URL (e.g., "https://github.com/user/repo")
-        path: Path within the repository (e.g., "example_pkg")
+        repo: Repository URL (can be constructed from package_def)
         version: Version/tag to load (e.g., "v1.0.0", ">=0.3.2", "latest")
-        target_dir: Directory to copy to (default: {path})
-        branch: Branch to use if no version specified (default: "main")
-        clean: Whether to clean existing target directory (default: False)
-        gitdbs_config: Path to gitdbs config file
-        
-    Returns:
-        Dict containing operation result with keys:
-        - success: bool
-        - target_dir: str
-        - repo: str
-        - path: str
-        - version: str
-        - message: str
-        
-    Raises:
-        FileNotFoundError: If local repository not found
-        ValueError: If invalid parameters
-    """
-    # Validate inputs
-    if not repo:
-        raise ValueError("Repository URL is required")
-    
-    if not path:
-        raise ValueError("Path within repository is required")
-    
-    # Get local repository path
-    local_repo_path = get_local_repo_path(repo, gitdbs_config)
-    if not local_repo_path:
-        raise FileNotFoundError(f"Local repository not found for {repo}. Check {gitdbs_config}")
-    
-    if not os.path.exists(local_repo_path):
-        raise FileNotFoundError(f"Local repository path does not exist: {local_repo_path}")
-    
-    # Set default target directory
-    if target_dir is None:
-        target_dir = path
-    
-    # Clean target directory if it exists and clean=True
-    if clean and os.path.exists(target_dir):
-        shutil.rmtree(target_dir)
-    
-    # Create target directory if it doesn't exist
-    os.makedirs(os.path.dirname(target_dir) if os.path.dirname(target_dir) else ".", exist_ok=True)
-    
-    try:
-        # Checkout appropriate version/branch
-        if version:
-            if version == "latest":
-                # Get latest tag
-                latest_tag = _find_latest_tag(local_repo_path)
-                if not latest_tag:
-                    raise ValueError(f"No tags found in repository")
-                shell(f"cd {local_repo_path} && git checkout {latest_tag}")
-                actual_version = latest_tag
-            else:
-                # Check if it's a direct tag name or version spec
-                if '/' in version:
-                    # Direct tag name - use as is
-                    shell(f"cd {local_repo_path} && git checkout {version}")
-                    actual_version = version
-                else:
-                    # Version specification - find matching tag
-                    matching_tag = _find_matching_tag(local_repo_path, version)
-                    if not matching_tag:
-                        raise ValueError(f"No tag found matching version {version}")
-                    shell(f"cd {local_repo_path} && git checkout {matching_tag}")
-                    actual_version = matching_tag
-        else:
-            # Use branch
-            shell(f"cd {local_repo_path} && git checkout {branch}")
-            actual_version = branch
-        
-        # Copy files from local repository
-        source_path = os.path.join(local_repo_path, path)
-        if not os.path.exists(source_path):
-            raise FileNotFoundError(f"Path '{path}' not found in repository")
-        
-        if os.path.isdir(source_path):
-            shutil.copytree(source_path, target_dir, dirs_exist_ok=True)
-        else:
-            shutil.copy2(source_path, target_dir)
-        
-        return {
-            "success": True,
-            "target_dir": target_dir,
-            "repo": repo,
-            "path": path,
-            "version": actual_version,
-            "message": f"Successfully loaded package from local {repo}/{path}"
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "target_dir": target_dir,
-            "repo": repo,
-            "path": path,
-            "version": version or branch,
-            "message": f"Failed to load package: {e}",
-            "error": e
-        }
-
-
-def load_pkg_from_config(
-    config: Dict[str, Any],
-    target_dir: Optional[str] = None,
-    clean: bool = False,
-    gitdbs_config: str = ".miniature/gitdbs.json"
-) -> Dict[str, Any]:
-    """Load a package using configuration dictionary.
-    
-    Args:
-        config: Dictionary with keys: repo, path, version, branch
-        target_dir: Directory to copy to
+        target_dir: Directory to copy/link to
+        branch: Branch to use if no version specified
         clean: Whether to clean existing target directory
-        gitdbs_config: Path to gitdbs config file
-        
+        gitdbs_config: DEPRECATED - Path to gitdbs config file
+        cache_dir: Cache directory path
+        package_def: PackageDefinition object with full repotree config
+        use_symlink: Whether to create symlink instead of copying
+
     Returns:
         Dict containing operation result
     """
-    return load_pkg(
-        repo=config.get('repo'),
-        path=config.get('path'),
-        version=config.get('version'),
-        target_dir=target_dir,
-        branch=config.get('branch', 'main'),
-        clean=clean,
-        gitdbs_config=gitdbs_config
-    )
+    # Handle package_def for repotree compatibility
+    if package_def:
+        repo = repo or package_def.get_repo_url()
+        branch = branch if branch != "main" else package_def.get_branch_or_tag()
+        target_dir = target_dir or package_def.local_dir
+
+        # Handle as_pkg for version constraints
+        if package_def.as_pkg:
+            version = version or package_def.as_pkg.version
+
+    # Validate inputs
+    if not repo:
+        return {"success": False, "message": "Repository URL is required"}
+
+    # Set default target directory
+    if target_dir is None:
+        # Extract repository name from URL
+        repo_name = repo.rstrip('/').split('/')[-1]
+        if repo_name.endswith('.git'):
+            repo_name = repo_name[:-4]
+        # Add branch suffix if not main/master
+        if branch not in ['main', 'master']:
+            target_dir = f"{repo_name}-{branch}"
+        else:
+            target_dir = repo_name
+
+    target_path = Path(target_dir)
+
+    # Clean target directory if requested
+    if clean and target_path.exists():
+        if target_path.is_symlink():
+            target_path.unlink()
+        else:
+            shutil.rmtree(target_path)
+
+    try:
+        # Get cache instance
+        cache = get_cache(Path(cache_dir) if cache_dir else None)
+
+        # Clone or update repository in cache
+        repo_path = cache.clone_or_update(repo, branch)
+
+        # Get the git repository
+        git_repo = Repo(repo_path)
+
+        # Determine version to checkout
+        actual_version = None
+
+        if version:
+            if version == "latest":
+                # Get latest tag for the repository
+                latest_tag = _find_latest_tag(git_repo)
+                if latest_tag:
+                    git_repo.git.checkout(latest_tag)
+                    actual_version = latest_tag
+                else:
+                    # No tags, use current branch
+                    actual_version = git_repo.active_branch.name
+            else:
+                # Check if it's a direct tag/commit or version spec
+                if "/" in version or _is_commit_sha(version):
+                    # Direct reference
+                    git_repo.git.checkout(version)
+                    actual_version = version
+                else:
+                    # Version specification - find matching tag
+                    matching_tag = _find_matching_tag(git_repo, version)
+                    if matching_tag:
+                        git_repo.git.checkout(matching_tag)
+                        actual_version = matching_tag
+                    else:
+                        return {
+                            "success": False,
+                            "message": f"No tag found matching version {version}",
+                        }
+        else:
+            # Checkout branch
+            if branch in git_repo.heads:
+                git_repo.heads[branch].checkout()
+            elif f"origin/{branch}" in git_repo.refs:
+                git_repo.create_head(branch, f"origin/{branch}").checkout()
+            actual_version = branch
+
+        # Create target directory parent if needed
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Copy or symlink entire repository
+        if use_symlink:
+            cache.create_symlink(repo, target_path, ".", branch)
+        else:
+            # Copy entire repository
+            shutil.copytree(repo_path, target_path, dirs_exist_ok=True)
+            
+            # If target is on Windows filesystem (WSL), disable filemode tracking
+            from .utils import should_disable_filemode, fix_git_filemode
+            if should_disable_filemode(str(target_path)):
+                try:
+                    fix_git_filemode(str(target_path))
+                    print(f"Note: Disabled git filemode tracking for Windows filesystem")
+                except Exception:
+                    pass  # Silently ignore if fix fails
+
+        # Handle custom config if present
+        if package_def and package_def.custom_config.install:
+            print(
+                f"Note: Run '{package_def.custom_config.install}' to install the package"
+            )
+
+        return {
+            "success": True,
+            "target_dir": str(target_path),
+            "repo": repo,
+            "branch": branch,
+            "version": actual_version,
+            "message": f"Successfully loaded repository from {repo} (branch: {branch})",
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "target_dir": str(target_path),
+            "repo": repo,
+            "branch": branch,
+            "version": version or branch,
+            "message": f"Failed to load repository: {e}",
+            "error": e,
+        }
 
 
 def load_pkgs_from_file(
     config_file: str,
     package_names: Optional[List[str]] = None,
     clean: bool = False,
-    gitdbs_config: str = ".miniature/gitdbs.json"
-) -> Dict[str, Any]:
-    """Load packages from a config file.
-    
+    gitdbs_config: Optional[str] = None,  # Deprecated
+    cache_dir: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Load packages from a configuration file.
+
+    Supports pkg.json (with dependencies), miniature.json, and repotree.json formats.
+
     Args:
-        config_file: Path to config file (JSON)
+        config_file: Path to config file (pkg.json, miniature.json, or repotree.json)
         package_names: List of package names to load (None = load all)
         clean: Whether to clean existing target directories
-        gitdbs_config: Path to gitdbs config file
-        
+        gitdbs_config: DEPRECATED
+        cache_dir: Cache directory path
+
     Returns:
-        Dict containing operation results with keys:
-        - success: bool
-        - results: Dict mapping package names to their results
-        - message: str
+        List of results for each package
     """
-    # Load config file
-    if not os.path.exists(config_file):
+    config_path = Path(config_file)
+
+    if not config_path.exists():
         raise FileNotFoundError(f"Config file not found: {config_file}")
-    
-    with open(config_file, 'r') as f:
-        config_data = json.load(f)
-    
-    # Validate config structure
-    if not isinstance(config_data, dict) or 'packages' not in config_data:
-        raise ValueError("Config file must contain 'packages' object")
-    
-    packages = config_data['packages']
-    
-    # Determine which packages to load
-    if package_names is None:
-        package_names = list(packages.keys())
-    
-    # Load packages
-    results = {}
-    for name in package_names:
-        if name not in packages:
-            results[name] = {
-                "success": False,
-                "message": f"Package '{name}' not found in config"
-            }
-            continue
-        
-        pkg_config = packages[name]
-        
-        # Extract config values
-        repo = pkg_config.get('db-repo')
-        root_dir = pkg_config.get('root-dir', '')
-        version = pkg_config.get('version')
-        branch = pkg_config.get('branch', 'main')
-        target_dir = pkg_config.get('target-dir')
-        
-        if not repo:
-            results[name] = {
-                "success": False,
-                "message": f"No 'db-repo' found for package '{name}'"
-            }
-            continue
-        
-        # Load the package
-        result = load_pkg(
-            repo=repo,
-            path=root_dir,
-            version=version,
-            target_dir=target_dir,
-            branch=branch,
-            clean=clean,
-            gitdbs_config=gitdbs_config
+
+    with open(config_path, "r") as f:
+        data = json.load(f)
+
+    results = []
+
+    # Check if it's pkg.json format (has "dependencies" array and optionally "name")
+    if "dependencies" in data and isinstance(data["dependencies"], list):
+        # Load as pkg.json with dependencies
+        pkg_config = PkgJson.from_file(config_path)
+
+        for entry in pkg_config.dependencies:
+            if package_names and entry.pkg_name not in package_names:
+                continue
+
+            # Set loaded=True for dependencies we want to load
+            entry.loaded = True
+
+            result = load_pkg(
+                package_def=entry,
+                clean=clean,
+                cache_dir=cache_dir,
+                use_symlink=False,  # TODO: Make configurable
+            )
+            results.append(result)
+
+    # Check if it's repotree format (has "miniatures" or "repos")
+    elif "miniatures" in data or "repos" in data:
+        # Load as repotree config
+        config = RepotreeConfig.from_file(config_path)
+
+        for entry in config.get_loaded_entries():
+            if package_names and entry.pkg_name not in package_names:
+                continue
+
+            result = load_pkg(
+                package_def=entry,
+                clean=clean,
+                cache_dir=cache_dir,
+                use_symlink=False,  # TODO: Make configurable
+            )
+            results.append(result)
+
+    # Legacy miniature format with "packages"
+    elif "packages" in data:
+        packages = data["packages"]
+
+        if package_names is None:
+            package_names = list(packages.keys())
+
+        for name in package_names:
+            if name not in packages:
+                results.append(
+                    {
+                        "success": False,
+                        "message": f"Package '{name}' not found in config",
+                    }
+                )
+                continue
+
+            pkg_config = packages[name]
+
+            # Convert to PackageDefinition
+            package_def = PackageDefinition(
+                pkg_name=name,
+                domain=pkg_config.get("db-repo", ""),
+                path_name=pkg_config.get("root-dir", "."),
+                branch=pkg_config.get("branch", "main"),
+                local_dir=pkg_config.get("target-dir", name),
+                version=pkg_config.get("version"),
+                loaded=True,
+            )
+
+            result = load_pkg(package_def=package_def, clean=clean, cache_dir=cache_dir)
+            results.append(result)
+
+    else:
+        raise ValueError(
+            "Invalid config file format - expected 'dependencies', 'miniatures', or 'packages' field"
         )
-        results[name] = result
-    
-    # Create summary
-    success_count = sum(1 for r in results.values() if r["success"])
-    total_count = len(results)
-    all_success = success_count == total_count
-    
-    message = f"Loaded {success_count}/{total_count} packages"
-    if not all_success:
-        message += " (some failed)"
-    
-    return {
-        "success": all_success,
-        "results": results,
-        "message": message
-    }
+
+    return results
 
 
-def _find_latest_tag(repo_path: str) -> Optional[str]:
-    """Find the latest tag in a local repository.
-    
+def _find_latest_tag(repo: Repo) -> Optional[str]:
+    """Find the latest tag in a repository.
+
     Args:
-        repo_path: Path to local git repository
-        
+        repo: Git repository object
+
     Returns:
-        Latest tag name or None if no tags found
+        Latest tag name or None
     """
     try:
-        tags_output = shell(f"cd {repo_path} && git tag -l")
-        tags = [tag.strip() for tag in tags_output.strip().split('\n') if tag.strip()]
-        
+        tags = list(repo.tags)
+
         if not tags:
             return None
-        
-        # Sort tags by version
-        import packaging.version
+
+        # Get all tags
+        package_tags = [str(tag.name) for tag in tags]
+
+        # Sort by version
         version_tags = []
-        
-        for tag in tags:
+
+        for tag_name in package_tags:
             try:
-                # Extract version part from tag (e.g., "example_pkg/0.1.1" -> "0.1.1")
-                version_part = tag.split('/')[-1] if '/' in tag else tag
-                tag_ver = packaging.version.parse(version_part.lstrip('v'))
-                version_tags.append((tag, tag_ver))
+                # Extract version part
+                if "/" in tag_name:
+                    version_part = tag_name.split("/")[-1]
+                else:
+                    version_part = tag_name
+
+                # Remove 'v' prefix if present
+                version_part = version_part.lstrip("v")
+
+                ver = packaging.version.parse(version_part)
+                version_tags.append((tag_name, ver))
             except packaging.version.InvalidVersion:
                 continue
-        
+
         if not version_tags:
-            return tags[-1]  # Return last tag if no valid versions
-        
+            return package_tags[-1]  # Return last tag if no valid versions
+
         # Sort by version and return latest
         version_tags.sort(key=lambda x: x[1])
         return version_tags[-1][0]
-            
+
     except Exception:
         return None
 
 
-def _find_matching_tag(repo_path: str, version_spec: str) -> Optional[str]:
-    """Find a tag matching version specification in a local repository.
-    
+def _find_matching_tag(repo: Repo, version_spec: str) -> Optional[str]:
+    """Find a tag matching version specification.
+
     Args:
-        repo_path: Path to local git repository
-        version_spec: Version specification (e.g., "0.3.2", ">=0.3.2")
-        
+        repo: Git repository object
+        version_spec: Version specification (e.g., ">=1.0.0")
+
     Returns:
-        Matching tag name or None if no match found
+        Matching tag name or None
     """
     try:
-        tags_output = shell(f"cd {repo_path} && git tag -l")
-        tags = [tag.strip() for tag in tags_output.strip().split('\n') if tag.strip()]
-        
+        tags = list(repo.tags)
+
         if not tags:
             return None
-        
-        # Parse version specification
-        import packaging.version
-        import packaging.specifiers
-        
-        # Create specifier set for version requirements
+
+        # Create specifier set
         specifier_set = packaging.specifiers.SpecifierSet(version_spec)
-        
+
+        # Filter and match tags
         valid_tags = []
+
         for tag in tags:
+            tag_name = str(tag.name)
+
             try:
-                # Extract version part from tag (e.g., "example_pkg/0.1.1" -> "0.1.1")
-                version_part = tag.split('/')[-1] if '/' in tag else tag
-                tag_ver = packaging.version.parse(version_part.lstrip('v'))
-                
+                # Extract version part
+                if "/" in tag_name:
+                    version_part = tag_name.split("/")[-1]
+                else:
+                    version_part = tag_name
+
+                # Remove 'v' prefix if present
+                version_part = version_part.lstrip("v")
+
+                ver = packaging.version.parse(version_part)
+
                 # Check if version matches specifier
-                if tag_ver in specifier_set:
-                    valid_tags.append((tag, tag_ver))
+                if ver in specifier_set:
+                    valid_tags.append((tag_name, ver))
             except packaging.version.InvalidVersion:
                 continue
-        
+
         if not valid_tags:
             return None
-        
-        # Sort by version and return latest
+
+        # Sort by version and return latest matching
         valid_tags.sort(key=lambda x: x[1])
         return valid_tags[-1][0]
-            
+
     except Exception:
         return None
 
 
-def setup_local_repository(
-    repo_url: str,
-    local_path: str,
-    gitdbs_config: str = ".miniature/gitdbs.json"
-) -> Dict[str, Any]:
-    """Setup a local repository by cloning it if it doesn't exist.
-    
-    Args:
-        repo_url: Repository URL to clone
-        local_path: Local path where to clone the repository
-        gitdbs_config: Path to gitdbs config file to update
-        
-    Returns:
-        Dict containing operation result with keys:
-        - success: bool
-        - local_path: str
-        - message: str
-    """
-    # Expand user path
-    if local_path.startswith('~'):
-        local_path = os.path.expanduser(local_path)
-    
-    # Check if repository already exists
-    if os.path.exists(local_path):
-        return {
-            "success": True,
-            "local_path": local_path,
-            "message": f"Repository already exists at {local_path}"
-        }
-    
-    try:
-        # Create parent directory
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        
-        # Clone repository
-        shell(f"git clone {repo_url} {local_path}")
-        
-        # Update gitdbs config
-        _update_gitdbs_config(repo_url, local_path, gitdbs_config)
-        
-        return {
-            "success": True,
-            "local_path": local_path,
-            "message": f"Repository cloned to {local_path}"
-        }
-        
-    except Exception as e:
-        return {
-            "success": False,
-            "local_path": local_path,
-            "message": f"Failed to clone repository: {e}",
-            "error": e
-        }
-
-
-def _update_gitdbs_config(repo_url: str, local_path: str, gitdbs_config: str):
-    """Update gitdbs config file with new repository entry."""
-    configs = []
-    
-    # Load existing config
-    if os.path.exists(gitdbs_config):
-        with open(gitdbs_config, 'r') as f:
-            configs = json.load(f)
-    
-    # Check if entry already exists
-    for config in configs:
-        if config.get('db-repo') == repo_url:
-            config['local_path'] = local_path
-            break
-    else:
-        # Add new entry
-        configs.append({
-            "name": repo_url.split('/')[-1].replace('.git', ''),
-            "description": f"Local copy of {repo_url}",
-            "db-repo": repo_url,
-            "local_path": local_path
-        })
-    
-    # Create directory if it doesn't exist
-    os.makedirs(os.path.dirname(gitdbs_config), exist_ok=True)
-    
-    # Write updated config
-    with open(gitdbs_config, 'w') as f:
-        json.dump(configs, f, indent=4)
-
+def _is_commit_sha(value: str) -> bool:
+    """Check if a value is a git commit SHA."""
+    return bool(re.match(r"^[0-9a-f]{6,40}$", value, re.IGNORECASE))
