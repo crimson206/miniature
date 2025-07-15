@@ -8,4 +8,13 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "pyshell",
+    "packaging",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "allure-pytest>=2.13.0",
+    "pytest-bdd>=6.0.0",
 ]

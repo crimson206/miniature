@@ -1,0 +1,16 @@
+{
+    "miniatures": [
+        {
+            "pathName": "component/my-card",
+            "repo": "https://github.com/crimson206/db-repo",
+            "version": "0.1.0",
+            "link": "src/component/my_card"
+        },
+        {
+            "pathName": "component/any-name",
+            "repo": "https://github.com/crimson206/my-card2",
+            "version": "0.1.0",
+            "link": "src/component/my_card2"
+        }
+    ]
+}
