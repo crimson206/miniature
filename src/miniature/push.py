@@ -1,9 +1,15 @@
 import json
 import os
 import shutil
+import sys
 from typing import Optional, Dict, Any
 from pathlib import Path
-from pyshell import shell, ShellError
+
+# Add local pyshell to path to use our version instead of system-installed one
+_local_pyshell_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'pyshell', 'src')
+sys.path.insert(0, _local_pyshell_path)
+from pyshell.core import shell, ShellError
+sys.path.remove(_local_pyshell_path)  # Clean up after import
 from .cache import get_cache
 
 

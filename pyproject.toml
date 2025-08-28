@@ -9,7 +9,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "runpycli>=0.1.0",
-    "pyshell",
+    "pyshell @ git+https://github.com/crimson206/pyshell.git",
     "packaging",
     "gitpython",
 ]

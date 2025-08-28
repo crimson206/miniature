@@ -1,0 +1,20 @@
+{
+  "miniatures": [
+    {
+      "pkgName": "runpy",
+      "domain": "https://github.com/",
+      "repoName": "crimson206/runpy",
+      "branch": "main",
+      "localDir": "runpy",
+      "loaded": true
+    },
+    {
+      "pkgName": "runpy-dev",
+      "domain": "https://github.com/",
+      "repoName": "crimson206/runpy",
+      "branch": "dev",
+      "localDir": "runpy-dev",
+      "loaded": true
+    }
+  ]
+}
